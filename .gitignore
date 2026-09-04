@@ -1,8 +1,9 @@
-# Real secrets live here - copy config.example.h to config.h and fill in
-# your own WiFi/OTA/MQTT credentials. Never commit config.h itself.
-config.h
+# Real secrets live here - copy src/config.example.h to src/config.h and
+# fill in your own WiFi/OTA/MQTT credentials. Never commit config.h itself.
+src/config.h
 
-# Arduino/IDE build artifacts, if ever built inside this folder
+# PlatformIO / Arduino build artifacts
+.pio/
 build/
 *.bin
 *.elf

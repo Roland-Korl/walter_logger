@@ -1,5 +1,5 @@
 /**
- * @file walter_feels_solar_test.ino
+ * @file main.cpp
  * @brief Solar panel + LiFePO4 charging test node, built on Walter Feels.
  *
  * One of three identical nodes described in the "solar-panel-test-handover"
@@ -23,9 +23,9 @@
  * verified vs. what still needs re-checking against the full ADI
  * datasheet).
  *
- * Required libraries (Library Manager): ArduinoJson (v7), OneWire,
- * DallasTemperature. WalterModem is assumed installed as this project's
- * board support library. WiFi/WebServer ship with the esp32 Arduino core.
+ * The dashboard/JSON API/OTA-update web server lives in portal.cpp/.h, not
+ * here - main.cpp only orchestrates sensor bring-up, telemetry collection,
+ * and the WiFi/cellular transports.
  */
 
 #include <Arduino.h>
@@ -40,6 +40,7 @@
 #include "lps22hb.h"
 #include "ds18b20.h"
 #include "telemetry.h"
+#include "portal.h"
 #include "config.h"
 
 #if CO2_SENSOR_ENABLED
@@ -48,20 +49,7 @@
 
 #if TELEMETRY_TRANSPORT_WIFI
 #include <WiFi.h>
-#include <WebServer.h>
-#include <ArduinoJson.h>
 #include <esp_ota_ops.h>
-/* ElegantOTA defaults to ESPAsyncWebServer - this project already uses
- * the synchronous WebServer for everything else, so pin it to that
- * instead of pulling in a second, parallel web server stack. This has
- * to be a real compiler -D flag (see build_opt.h in this sketch folder,
- * "-DELEGANTOTA_USE_ASYNC_WEBSERVER=0"), NOT just a #define here - the
- * library's own ElegantOTA.cpp is a separate translation unit and never
- * sees a #define made only in this .ino. (Also patched a genuine bug in
- * the installed ElegantOTA.h: it used to force this macro to 1
- * unconditionally before its own ifndef-guarded default could apply -
- * see the FIX comment near the top of that file.) */
-#include <ElegantOTA.h>
 #if MQTT_WIFI_ENABLED
 #include <WiFiClient.h>
 #include <PubSubClient.h>
@@ -88,8 +76,8 @@
 RTC_DATA_ATTR static uint32_t rtc_boot_count = 0;
 RTC_DATA_ATTR static uint32_t rtc_cold_block_cycles = 0;
 
-static char json_buf[2048]; /* sized generously for chg.flags.* plus every optional section */
 static telemetry_sample_t latest_sample;
+static char json_buf[2048]; /* used for the cellular publish and the WiFi-MQTT bridge publish */
 static bool charger_ok = false;
 
 static HDC1080 hdc1080;
@@ -100,7 +88,6 @@ static bool co2_sensor_installed = false;
 #endif
 
 #if TELEMETRY_TRANSPORT_WIFI
-static WebServer server(HTTP_SERVER_PORT);
 #if MQTT_WIFI_ENABLED
 static WiFiClient mqttTcpClient;
 static PubSubClient mqttClient(mqttTcpClient);
@@ -112,44 +99,6 @@ static WalterModem modem;
 static char mqtt_topic[64];
 static char mqtt_client_id[48];
 #endif
-
-/* ---------------------------------------------------------------------
- * In-memory sample history, for the dashboard's trend sparklines. Not
- * persisted (RAM only - fine, it's a UI nicety, not a data record; the
- * actual measurement record of the test lives wherever the JSON gets
- * logged, MQTT broker or otherwise). One entry per collectTelemetry()
- * call, i.e. one per SLEEP_INTERVAL_S - HISTORY_LEN=120 is 2 hours of
- * trend at the default 60s interval.
- * ------------------------------------------------------------------- */
-#define HISTORY_LEN 120
-typedef struct {
-  float vin_v;
-  float iin_a;
-  float vbat_v;
-  float ibat_a;
-  float ntc_c;
-  bool ntc_valid;
-} history_entry_t;
-
-static history_entry_t history[HISTORY_LEN];
-static uint16_t history_count = 0; /* number of valid entries, caps at HISTORY_LEN */
-static uint16_t history_head = 0;  /* index the NEXT entry will be written to */
-
-static void historyPush(const telemetry_sample_t* s)
-{
-  history_entry_t* e = &history[history_head];
-  e->vin_v = s->vin_v;
-  e->iin_a = s->iin_a;
-  e->vbat_v = s->vbat_v;
-  e->ibat_a = s->ibat_a;
-  e->ntc_c = s->ntc_temp_c;
-  e->ntc_valid = s->ntc_valid;
-
-  history_head = (history_head + 1) % HISTORY_LEN;
-  if(history_count < HISTORY_LEN) {
-    history_count++;
-  }
-}
 
 /* ---------------------------------------------------------------------
  * LTC4015 boot-time safety sequence.
@@ -165,6 +114,9 @@ static void historyPush(const telemetry_sample_t* s)
  *    path - is what ultimately decides whether current flows.
  *  - Cell-count/chemistry mismatch (wrong solder jumpers) is treated the
  *    same as an invalid temperature reading: stay suspended.
+ *
+ * UNCHANGED from the original firmware - this is charging-safety-critical
+ * code and is explicitly out of scope for the OTA/config rework.
  * ------------------------------------------------------------------- */
 static bool ltc4015SafeInit()
 {
@@ -354,12 +306,12 @@ static void collectTelemetry(telemetry_sample_t* s)
   }
 #endif
 
-  historyPush(s);
+  portalPushSample(s);
 }
 
 #if TELEMETRY_TRANSPORT_WIFI
 /* ---------------------------------------------------------------------
- * WiFi + local HTTP server (bring-up mode)
+ * WiFi (bring-up mode)
  * ------------------------------------------------------------------- */
 
 static bool wifiConnect()
@@ -380,244 +332,6 @@ static bool wifiConnect()
   Serial.println();
   Serial.printf("Connected to WiFi, IP address: %s\r\n", WiFi.localIP().toString().c_str());
   return true;
-}
-
-/* ---------------------------------------------------------------------
- * Dashboard page - static shell (dark, card-based, inspired by
- * https://pv.rw-portal.eu/), all values filled in client-side via
- * fetch() against /telemetry and /history. Served once from flash
- * (PROGMEM) - no per-request string building on the ESP32 side.
- * ------------------------------------------------------------------- */
-static const char DASHBOARD_HTML[] PROGMEM = R"HTMLPAGE(<!DOCTYPE html>
-<html lang="sk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Walter Feels</title>
-<style>
-:root{--bg:#0a0d12;--card:#12161d;--card2:#161b23;--border:#232a35;--text:#e8ecf1;--muted:#8a93a3;
---green:#3ecf8e;--blue:#4fa8f5;--orange:#f0955a;--red:#f0625a;--purple:#a78bfa;--yellow:#e8c14a;}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,Segoe UI,Roboto,sans-serif;font-size:14px}
-.wrap{max-width:1000px;margin:0 auto;padding:16px}
-header{display:flex;align-items:center;justify-content:space-between;padding:8px 4px 20px}
-header h1{font-size:17px;font-weight:600;margin:0;display:flex;align-items:center;gap:8px}
-.dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}
-.dot.ok{background:var(--green);box-shadow:0 0 6px var(--green)}
-.dot.bad{background:var(--red);box-shadow:0 0 6px var(--red)}
-.row{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:14px}
-.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;flex:1;min-width:260px}
-.card h3{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:0 0 12px;font-weight:600}
-.big{font-size:34px;font-weight:700;line-height:1}
-.big small{font-size:16px;color:var(--muted);font-weight:500;margin-left:2px}
-.sub{color:var(--muted);margin-top:4px}
-.badges{display:flex;gap:6px;margin-top:12px;flex-wrap:wrap}
-.badge{padding:4px 10px;border-radius:7px;font-size:12px;font-weight:600;background:#1b2129;color:var(--muted);border:1px solid var(--border)}
-.badge.on{background:rgba(62,207,142,.12);color:var(--green);border-color:rgba(62,207,142,.3)}
-.badge.warn{background:rgba(240,197,74,.12);color:var(--yellow);border-color:rgba(232,193,74,.3)}
-.badge.off{background:rgba(240,98,90,.12);color:var(--red);border-color:rgba(240,98,90,.3)}
-.flow{display:flex;align-items:center;justify-content:space-around;text-align:center;padding:8px 0}
-.flow .node{display:flex;flex-direction:column;align-items:center;gap:8px}
-.flow .icon{width:46px;height:46px;border-radius:50%;background:var(--card2);display:flex;align-items:center;justify-content:center;border:1px solid var(--border)}
-.flow .label{font-size:12px;color:var(--muted)}
-.flow .val{font-size:13px;font-weight:600}
-.flow .link{flex:1;height:0;border-top:2px dotted var(--border);margin:0 6px;position:relative;top:-19px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:14px}
-.stat{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px}
-.stat h4{display:flex;align-items:center;gap:6px;font-size:11px;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);margin:0 0 10px;font-weight:600}
-.stat .v{font-size:22px;font-weight:700}
-.stat .v small{font-size:13px;color:var(--muted);font-weight:500}
-.stat svg{width:100%;height:26px;margin-top:8px;display:block}
-.list{background:var(--card);border:1px solid var(--border);border-radius:12px;overflow:hidden}
-.list .item{display:flex;justify-content:space-between;padding:11px 16px;border-bottom:1px solid var(--border);font-size:13px}
-.list .item:last-child{border-bottom:none}
-.list .item span:first-child{color:var(--muted)}
-.list .item span:last-child{font-weight:600}
-footer{text-align:center;color:var(--muted);font-size:12px;padding:18px 0 4px}
-.err{background:rgba(240,98,90,.1);border:1px solid rgba(240,98,90,.35);color:var(--red);border-radius:10px;padding:10px 14px;margin-bottom:14px;display:none}
-</style></head>
-<body><div class="wrap">
-<header><h1><span class="dot" id="live-dot"></span>Walter Feels &mdash; solar/LiFePO4 test</h1><span class="sub"><span id="boot-label"></span> &middot; <a href="/update" style="color:var(--muted)">OTA update</a></span></header>
-<div class="err" id="err-banner">Nepodarilo sa nacitat telemetriu - skusam znova...</div>
-
-<div class="row">
-  <div class="card">
-    <h3>Stav nabijania</h3>
-    <div class="big" id="charge-state-big">&ndash;</div>
-    <div class="sub" id="charge-state-label">&ndash;</div>
-    <div class="badges" id="badges"></div>
-  </div>
-  <div class="card">
-    <h3>Tok energie</h3>
-    <div class="flow">
-      <div class="node"><div class="icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#e8c14a" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1" stroke-linecap="round"/></svg></div><div class="label">Panel</div><div class="val" id="flow-panel">&ndash;</div></div>
-      <div class="link"></div>
-      <div class="node"><div class="icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#3ecf8e" stroke-width="2"><rect x="2" y="7" width="17" height="10" rx="2"/><path d="M21 10v4" stroke-linecap="round"/></svg></div><div class="label">Batéria</div><div class="val" id="flow-batt">&ndash;</div></div>
-      <div class="link"></div>
-      <div class="node"><div class="icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="#4fa8f5" stroke="none"><path d="M13 2 4 14h6l-1 8 9-12h-6l1-8z"/></svg></div><div class="label">Systém</div><div class="val" id="flow-sys">&ndash;</div></div>
-    </div>
-  </div>
-</div>
-
-<div class="grid" id="stat-grid"></div>
-
-<div class="list" id="info-list"></div>
-
-<footer id="footer">&ndash;</footer>
-</div>
-<script>
-const $=id=>document.getElementById(id);
-const STATS=[
-  {key:'panel_w',label:'Vykon panela',unit:'W',hist:h=>h.map(e=>e.vin_v*e.iin_a),fmt:v=>v.toFixed(1)},
-  {key:'vin',label:'Napatie panela',unit:'V',hist:h=>h.map(e=>e.vin_v),fmt:v=>v.toFixed(2)},
-  {key:'vbat',label:'Napatie baterie',unit:'V',hist:h=>h.map(e=>e.vbat_v),fmt:v=>v.toFixed(3)},
-  {key:'ibat_ma',label:'Prud do baterie',unit:'mA',hist:h=>h.map(e=>e.ibat_a*1000),fmt:v=>v.toFixed(0)},
-  {key:'ntc',label:'Teplota NTC',unit:'&deg;C',hist:h=>h.map(e=>e.ntc_valid?e.ntc_c:null),fmt:v=>v.toFixed(1)},
-  {key:'jeita',label:'JEITA region',unit:'/7',fmt:v=>v},
-  {key:'bsr',label:'BSR (raw)',unit:'',fmt:v=>v},
-  {key:'wifi',label:'Signal WiFi',unit:'dBm',fmt:v=>v},
-];
-let statNodes={};
-function buildGrid(){
-  const grid=$('stat-grid');
-  STATS.forEach(s=>{
-    const el=document.createElement('div');
-    el.className='stat';
-    el.innerHTML=`<h4>${s.label}</h4><div class="v" id="stat-${s.key}">&ndash;</div>${s.hist?`<svg id="spark-${s.key}" viewBox="0 0 100 26" preserveAspectRatio="none"></svg>`:''}`;
-    grid.appendChild(el);
-    statNodes[s.key]=el.querySelector('.v');
-  });
-}
-function sparkline(svgId,values){
-  const svg=$(svgId);
-  if(!svg)return;
-  const v=values.filter(x=>x!==null&&x!==undefined&&!isNaN(x));
-  if(v.length<2){svg.innerHTML='';return;}
-  const min=Math.min(...v),max=Math.max(...v),range=(max-min)||1;
-  const pts=values.map((x,i)=>{
-    const px=(i/(values.length-1))*100;
-    if(x===null||x===undefined||isNaN(x))return null;
-    const py=26-((x-min)/range)*24-1;
-    return `${px.toFixed(1)},${py.toFixed(1)}`;
-  }).filter(p=>p!==null).join(' ');
-  svg.innerHTML=`<polyline points="${pts}" fill="none" stroke="currentColor" stroke-width="1.5" style="color:var(--blue)"/>`;
-}
-function badge(text,cls){const b=document.createElement('span');b.className='badge '+(cls||'');b.textContent=text;return b;}
-function chargeStateText(f){
-  if(f.charger_suspended)return['Pozastavene','warn'];
-  if(f.ntc_pause)return['Blokovane (chlad/teplo)','off'];
-  if(f.bat_missing_fault)return['Chyba: bateria chyba','off'];
-  if(f.bat_short_fault)return['Chyba: skrat baterie','off'];
-  if(f.precharge)return['Precharge','warn'];
-  if(f.absorb_charge)return['Absorb','on'];
-  if(f.cc_cv_charge)return['CC/CV nabijanie','on'];
-  if(f.timer_term||f.c_over_x_term)return['Ukoncene (plna)','on'];
-  return['Necinny','warn'];
-}
-async function refresh(){
-  try{
-    const [tRes,hRes]=await Promise.all([fetch('/telemetry'),fetch('/history')]);
-    if(!tRes.ok)throw new Error('telemetry '+tRes.status);
-    const t=await tRes.json();
-    const h=hRes.ok?await hRes.json():[];
-    $('err-banner').style.display='none';
-    $('live-dot').className='dot ok';
-    $('boot-label').textContent='Node '+t.node+' - boot #'+t.boot;
-
-    const [stateText,stateCls]=chargeStateText(t.chg.flags);
-    $('charge-state-big').innerHTML=(t.chg.vin*t.chg.iin).toFixed(1)+'<small>W z panela</small>';
-    $('charge-state-label').textContent='stav nabijania: '+stateText;
-
-    const badges=$('badges');badges.innerHTML='';
-    badges.appendChild(badge(stateText,stateCls));
-    if(t.chg.cold_block)badges.appendChild(badge('Blok. zima ('+t.chg.cold_block_cycles+'x)','off'));
-    if(t.wifi_rssi!==undefined)badges.appendChild(badge('WiFi '+t.wifi_rssi+' dBm',t.wifi_rssi>-70?'on':'warn'));
-    if(!t.chg.flags.ok_to_charge)badges.appendChild(badge('NOT ok_to_charge','off'));
-
-    $('flow-panel').textContent=(t.chg.vin*t.chg.iin).toFixed(1)+' W';
-    $('flow-batt').textContent=t.chg.vbat.toFixed(2)+' V '+(t.chg.ibat_a>0.005?'&#8593;':'');
-    $('flow-sys').textContent=t.chg.vsys.toFixed(2)+' V';
-
-    const vals={panel_w:t.chg.vin*t.chg.iin,vin:t.chg.vin,vbat:t.chg.vbat,ibat_ma:t.chg.ibat*1000,
-      ntc:t.chg.ntc_c,jeita:t.chg.jeita_region,bsr:t.chg.bsr_raw!==undefined?t.chg.bsr_raw:'-',
-      wifi:t.wifi_rssi!==undefined?t.wifi_rssi:'-'};
-    STATS.forEach(s=>{
-      const v=vals[s.key];
-      const node=statNodes[s.key];
-      if(node)node.innerHTML=(typeof v==='number'?s.fmt(v):v)+(s.unit?` <small>${s.unit}</small>`:'');
-      if(s.hist&&h.length)sparkline('spark-'+s.key,s.hist(h));
-    });
-
-    const info=$('info-list');info.innerHTML='';
-    const items=[
-      ['Chyby',(t.chg.flags.bat_missing_fault||t.chg.flags.bat_short_fault||t.chg.flags.max_charge_time_fault||t.chg.flags.thermal_shutdown)?'CHYBA - pozri raw JSON':'Bez chyby'],
-      ['Charger safety init',t.chg.flags.charger_enabled?'OK':'SUSPENDED'],
-      ['Cold-block cyklov',t.chg.cold_block_cycles],
-      ['DS18B20',t.temp.ds18b20_c!==null?t.temp.ds18b20_c.toFixed(2)+' &deg;C':'nepripojeny'],
-      ['Prostredie',t.env?t.env.temp_c.toFixed(1)+' &deg;C, '+t.env.hum_pct.toFixed(0)+'%, '+t.env.press_hpa.toFixed(0)+' hPa':'n/a'],
-    ];
-    items.forEach(([k,v])=>{
-      const row=document.createElement('div');row.className='item';
-      row.innerHTML=`<span>${k}</span><span>${v}</span>`;
-      info.appendChild(row);
-    });
-
-    $('footer').textContent='Posledna aktualizacia: '+new Date().toLocaleTimeString('sk-SK');
-  }catch(e){
-    $('err-banner').style.display='block';
-    $('live-dot').className='dot bad';
-  }
-}
-buildGrid();
-refresh();
-setInterval(refresh,5000);
-</script>
-</body></html>
-)HTMLPAGE";
-
-static void handleRoot()
-{
-  server.send_P(200, "text/html", DASHBOARD_HTML);
-}
-
-static void handleTelemetryJson()
-{
-  size_t len = telemetryToJson(&latest_sample, json_buf, sizeof(json_buf));
-  /* serializeJson() truncates (not cleanly) if the buffer is too small -
-   * treat "wrote right up to the edge of the buffer" as a failure too,
-   * not just len==0, so a future field addition that overflows the
-   * buffer fails loudly instead of silently serving corrupt JSON. */
-  if(len == 0 || len >= sizeof(json_buf) - 1) {
-    server.send(500, "application/json", "{\"error\":\"telemetry did not fit in buffer\"}");
-    return;
-  }
-  server.send(200, "application/json", json_buf);
-}
-
-static void handleHistoryJson()
-{
-  JsonDocument doc;
-  JsonArray arr = doc.to<JsonArray>();
-
-  /* Emit oldest-to-newest so the client doesn't have to reorder. */
-  uint16_t start = (history_count < HISTORY_LEN) ? 0 : history_head;
-  for(uint16_t i = 0; i < history_count; i++) {
-    uint16_t idx = (start + i) % HISTORY_LEN;
-    JsonObject e = arr.add<JsonObject>();
-    e["vin_v"] = history[idx].vin_v;
-    e["iin_a"] = history[idx].iin_a;
-    e["vbat_v"] = history[idx].vbat_v;
-    e["ibat_a"] = history[idx].ibat_a;
-    if(history[idx].ntc_valid) {
-      e["ntc_c"] = history[idx].ntc_c;
-    } else {
-      e["ntc_c"] = nullptr;
-    }
-  }
-
-  size_t len = serializeJson(doc, json_buf, sizeof(json_buf));
-  if(len == 0 || len >= sizeof(json_buf) - 1) {
-    server.send(500, "application/json", "[]");
-    return;
-  }
-  server.send(200, "application/json", json_buf);
 }
 #endif
 
@@ -739,7 +453,13 @@ void setup()
    * image stays "unconfirmed" (and gets auto-reverted to the previous
    * one on the next reset) until something in the new firmware calls
    * this. Getting this far in setup() is a reasonable "looks alive"
-   * signal. Harmless no-op if rollback isn't enabled in this build. */
+   * signal. Harmless no-op if rollback isn't enabled in this build.
+   *
+   * NOTE: this only proves "reached line X of setup()", not "WiFi/portal
+   * actually came up" - Phase 6 of the walter_logger rework plan moves
+   * this call to after a confirmed-successful connectivity check, to
+   * close that gap. Left exactly as in the original firmware for this
+   * phase (Phase 1 is toolchain/OTA-mechanism only). */
   esp_ota_mark_app_valid_cancel_rollback();
 #endif
 
@@ -762,18 +482,7 @@ void setup()
 
   collectTelemetry(&latest_sample);
 
-  server.on("/", handleRoot);
-  server.on("/telemetry", handleTelemetryJson);
-  server.on("/history", handleHistoryJson);
-  server.begin();
-
-  ElegantOTA.begin(&server, OTA_USERNAME, OTA_PASSWORD);
-  Serial.printf("HTTP server listening on port %d (OTA at /update)\r\n", HTTP_SERVER_PORT);
-  if(strcmp(OTA_PASSWORD, "CHANGE-ME-before-wall-mount") == 0) {
-    Serial.println("*** WARNING: OTA_PASSWORD is still the default placeholder - anyone on "
-                    "the WiFi network can push firmware to this board. Change it in config.h "
-                    "before mounting it somewhere you can't easily re-flash over USB. ***");
-  }
+  portalBegin();
 
 #if MQTT_WIFI_ENABLED
   snprintf(mqtt_wifi_topic, sizeof(mqtt_wifi_topic), "%s", MQTT_WIFI_TOPIC_FMT);
@@ -822,7 +531,7 @@ void setup()
         size_t len = telemetryToJson(&latest_sample, json_buf, sizeof(json_buf));
         /* len >= buffer size - 1 means serializeJson() truncated (not
          * cleanly) - treat that the same as len==0, see the identical
-         * check in handleTelemetryJson(). */
+         * check in portal.cpp's handleTelemetryJson(). */
         if(len > 0 && len < sizeof(json_buf) - 1) {
           Serial.printf("Publishing %u bytes to '%s':\r\n%s\r\n", (unsigned) len, mqtt_topic,
                         json_buf);
@@ -857,8 +566,7 @@ void setup()
 void loop()
 {
 #if TELEMETRY_TRANSPORT_WIFI
-  server.handleClient();
-  ElegantOTA.loop();
+  portalLoop();
 
   static uint32_t last_sample_ms = 0;
   uint32_t now = millis();

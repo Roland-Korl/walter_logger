@@ -7,7 +7,7 @@ rail standing in for the real device load. Reads the LTC4015 + onboard
 sensors + an independent DS18B20 once a minute and serves/publishes the
 result.
 
-## Two transport modes (`TELEMETRY_TRANSPORT_WIFI` in `config.h`)
+## Two transport modes (`TELEMETRY_TRANSPORT_WIFI` in `src/config.h`)
 
 - **WiFi (current default)** - connects to a local WiFi network, serves a
   live dashboard and JSON API over HTTP, supports OTA firmware updates,
@@ -22,7 +22,7 @@ result.
 
 Everything charger-safety-related (JEITA, chemistry/cell verification,
 default-suspended boot sequence) is identical in both modes - see
-`ltc4015SafeInit()` in the .ino.
+`ltc4015SafeInit()` in `src/main.cpp`.
 
 ## Before you flash
 
@@ -40,7 +40,7 @@ default-suspended boot sequence) is identical in both modes - see
 
 The firmware reads `CHEM_CELLS` back at boot and refuses to enable
 charging if this doesn't match `BATTERY_EXPECTED_CHEM` /
-`BATTERY_EXPECTED_CELL_COUNT` in `config.h`. This check only runs once,
+`BATTERY_EXPECTED_CELL_COUNT` in `src/config.h`. This check only runs once,
 at boot - if it fails (e.g. because the panel was disconnected at power-up
 so the LTC4015 had no valid measurement yet), charging stays suspended
 for the rest of that session even if conditions improve later. Reboot
@@ -52,7 +52,7 @@ for the rest of that session even if conditions improve later. Reboot
   the coldest/brightest conditions you'll test in** - see the separate
   panel-selection discussion; this is independent of this firmware).
 - 12.8V/20Ah LiFePO4 -> battery terminals.
-- DS18B20 data line -> `DS18B20_PIN` in `config.h` (defaults to
+- DS18B20 data line -> `DS18B20_PIN` in `src/config.h` (defaults to
   `WFEELS_PIN_GPIO_A`), with a 4.7k pull-up to 3V3. DS18B20 VDD -> 3V3,
   GND -> GND. This is the *independent cross-check* sensor - the primary,
   always-on safety cutoff is the LTC4015's own onboard NTC (already
@@ -61,63 +61,64 @@ for the rest of that session even if conditions improve later. Reboot
 
 ### 3. Set up `config.h`
 
-`config.h` is **gitignored** because it holds real WiFi/OTA/MQTT
+`src/config.h` is **gitignored** because it holds real WiFi/OTA/MQTT
 credentials. Copy the template and fill in your own values:
 
 ```bash
-cp config.example.h config.h
+cp src/config.example.h src/config.h
 ```
 
 At minimum for WiFi mode: `WIFI_SSID`, `WIFI_PASSWORD`, `OTA_PASSWORD`
 (change it from the placeholder before mounting the board anywhere you
 can't easily reach over USB - anyone who can authenticate at `/update`
 can push arbitrary firmware). Everything else has a reasoned default -
-see the comments in `config.example.h`.
+see the comments in `src/config.example.h`.
 
-### 4. Install libraries (Arduino Library Manager)
+### 4. Build with PlatformIO
 
-- `WalterModem` (this project's board support library)
-- `ArduinoJson` (v7.x)
-- `OneWire`
-- `DallasTemperature`
-- `ElegantOTA` (v3.x) - WiFi mode only, for `/update`
-- `PubSubClient` - WiFi mode only, if `MQTT_WIFI_ENABLED` (MQTT bridge)
+```bash
+pio run -e usb -t upload --upload-port COMx   # first flash / bench test only
+```
 
-`WiFi`, `WebServer`, `WiFiClient` ship with the esp32 Arduino core.
+`platformio.ini` pulls in all required libraries automatically
+(`WalterModem`, `ArduinoJson` v7, `OneWire`, `DallasTemperature`,
+`PubSubClient` for the WiFi-mode MQTT bridge) - no separate Library
+Manager step needed. There is intentionally **no ElegantOTA dependency**:
+OTA is handled directly via the ESP32 `<Update.h>` API in `src/portal.cpp`
+(same approach the `pv-logger-c3` sibling project already uses), which
+avoids a real upstream bug this project used to work around with a
+manually patched local copy of `ElegantOTA.h`.
 
-### 5. `build_opt.h` - required for WiFi mode, do not delete
+Once a device is mounted, every further update goes through
+`http://<node-ip>/update` (see "What's running" below) - there is no
+second, network-push OTA path (no `espota`/`ArduinoOTA`), by design: the
+`pv-logger-c3` sibling project's README documents that path failing
+against Windows Firewall even with correct auth, and a device with no
+physical fallback shouldn't depend on a path known to be flaky.
 
-This sketch folder includes a `build_opt.h` containing
-`-DELEGANTOTA_USE_ASYNC_WEBSERVER=0`. This is required to make ElegantOTA
-use the same synchronous `WebServer` the rest of this firmware uses,
-instead of pulling in a second, parallel async web server stack. Without
-it the build fails with a linker error
-(`undefined reference to ElegantOTAClass::begin(WebServer*, ...)`).
-
-**Also**: the installed `ElegantOTA.h` (as of v3.1.7) has a bug where it
-forces `ELEGANTOTA_USE_ASYNC_WEBSERVER` to `1` unconditionally before its
-own `#ifndef`-guarded default can apply, so `build_opt.h`'s `-D` flag
-alone isn't enough on an unpatched copy of the library. This was patched
-locally in `<sketchbook>/libraries/ElegantOTA/src/ElegantOTA.h` - see the
-`FIX (2026)` comment near the top of that file. If you set this project
-up on a fresh machine and hit the same linker error, check whether your
-installed copy needs the same one-block edit (properly wrap the default
-in an `#ifndef ELEGANTOTA_USE_ASYNC_WEBSERVER` instead of setting it
-unconditionally first).
-
-### 6. ESP32 core version
+### 5. ESP32 core version - pinned, not just "latest"
 
 Built and verified against **esp32 Arduino core 3.1.3**, not the newer
 3.3.x line. Core 3.2.0+ has a real regression in the new I2C driver
 (`esp32-hal-i2c-ng`) that makes every I2C transaction on this board fail
 with `ESP_ERR_INVALID_STATE` from the very first transaction - see
 [espressif/arduino-esp32#11374](https://github.com/espressif/arduino-esp32/issues/11374).
-3.1.3 uses the older, working I2C driver. Re-test before upgrading the
-core.
+3.1.3 uses the older, working I2C driver.
 
-The partition scheme used (`fatflash`, "16M Flash (2MB APP/12.5MB
-FATFS)") already has dual OTA app partitions (`app0`/`app1`, otadata) -
-no partition table change is needed for OTA to work.
+`platformio.ini` pins this explicitly via `platform_packages` (the
+framework is fetched from the official 3.1.3 GitHub release zip, not
+just a `platform = espressif32@X.Y.Z` version number, since that mapping
+isn't precise enough to trust blindly for a board with no physical
+fallback). **Verify after the first `pio run`** that the resolved core is
+actually 3.1.3 before relying on it - re-test this pin before ever
+upgrading it.
+
+The partition scheme (`ffat.csv`, vendored in this repo, copied verbatim
+from the Arduino IDE's "fatflash" / "16M Flash (2MB APP/12.5MB FATFS)"
+board-manager entry - **not** hand-typed offsets, to guarantee the OTA
+slot boundaries match what's already burned into a device flashed via
+Arduino IDE) has dual OTA app partitions (`app0`/`app1`, `otadata`) - no
+further partition table change is needed for OTA to work.
 
 ## What's running (WiFi mode)
 
@@ -129,15 +130,17 @@ no partition table change is needed for OTA to work.
 - **`/telemetry`** - the latest sample as JSON (see below).
 - **`/history`** - up to `HISTORY_LEN` (120) recent samples, oldest
   first, for the dashboard's sparklines. RAM-only, not persisted.
-- **`/update`** - ElegantOTA firmware upload page, HTTP Basic Auth
-  (`OTA_USERNAME`/`OTA_PASSWORD`). Verified end-to-end: `GET /ota/start`
-  then `POST /ota/upload` (multipart, the exported `.bin`) reflashes and
-  reboots the board with no USB access needed.
+- **`/update`** - firmware upload page (`<Update.h>`-based, HTTP Basic
+  Auth via `OTA_USERNAME`/`OTA_PASSWORD`). `GET /update` serves the upload
+  form, `POST /update` (multipart, the exported `.bin`) streams straight
+  to flash and reboots the board with no USB access needed - this is the
+  **only** OTA path in this project (see "Build with PlatformIO" above
+  for why a second, network-push path was deliberately left out).
 - **MQTT bridge** (`MQTT_WIFI_ENABLED`) - if enabled, also publishes the
   same JSON to `MQTT_WIFI_HOST:MQTT_WIFI_PORT` on `MQTT_WIFI_TOPIC_FMT`,
   independent of (and non-blocking for) the HTTP server above. **Not yet
   confirmed working end-to-end** - see the comment block above
-  `MQTT_WIFI_ENABLED` in `config.example.h`: neither "is the broker
+  `MQTT_WIFI_ENABLED` in `src/config.example.h`: neither "is the broker
   actually reachable from this node's WiFi network" nor "does the topic/
   payload match what the receiving backend expects" has been verified.
   Check the serial log (`MQTT connect to ...: OK/FAILED`) after flashing.
@@ -215,7 +218,7 @@ no partition table change is needed for OTA to work.
    real sensor in a fridge/freezer) that charging stops and resumes at
    the expected temperatures.
 2. `VCHARGE_JEITA_*` registers are deliberately left unconfigured - see
-   `ltc4015.h`. Only relevant if you switch to a *programmable* (not
+   `src/ltc4015.h`. Only relevant if you switch to a *programmable* (not
    fixed) chemistry setting later.
 3. `set_input_voltage_min()` is a stub (not wired into the boot
    sequence) - the VIN_UVCL_SETTING code-to-volts formula wasn't

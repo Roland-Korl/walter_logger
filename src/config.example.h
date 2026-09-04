@@ -64,7 +64,10 @@
 #define WIFI_CONNECT_TIMEOUT_S 20
 
 /* ---------------------------------------------------------------------
- * OTA firmware updates (ElegantOTA), reachable at http://<node-ip>/update.
+ * OTA firmware updates, reachable at http://<node-ip>/update (HTTP Basic
+ * Auth, handled directly via <Update.h> in portal.cpp - not ElegantOTA,
+ * which this project dropped in favor of the same dependency-free
+ * handler the pv-logger-c3 sibling project already relies on).
  *
  * IMPORTANT: anyone who can authenticate here can push arbitrary
  * firmware to this board - set a real OTA_PASSWORD before mounting the
