@@ -81,13 +81,26 @@ pio run -e usb -t upload --upload-port COMx   # first flash / bench test only
 ```
 
 `platformio.ini` pulls in all required libraries automatically
-(`WalterModem`, `ArduinoJson` v7, `OneWire`, `DallasTemperature`,
-`PubSubClient` for the WiFi-mode MQTT bridge) - no separate Library
-Manager step needed. There is intentionally **no ElegantOTA dependency**:
-OTA is handled directly via the ESP32 `<Update.h>` API in `src/portal.cpp`
-(same approach the `pv-logger-c3` sibling project already uses), which
-avoids a real upstream bug this project used to work around with a
-manually patched local copy of `ElegantOTA.h`.
+(`ArduinoJson` v7, `OneWire`, `DallasTemperature`, `PubSubClient` for the
+WiFi-mode MQTT bridge) - no separate Library Manager step needed. There
+is intentionally **no ElegantOTA dependency**: OTA is handled directly
+via the ESP32 `<Update.h>` API in `src/portal.cpp` (same approach the
+`pv-logger-c3` sibling project already uses), which avoids a real
+upstream bug this project used to work around with a manually patched
+local copy of `ElegantOTA.h`.
+
+`WalterModem` is deliberately **not** in `lib_deps` right now, even
+though `src/main.cpp`'s cellular (`#else`) branch still references it:
+PlatformIO compiles every source file of a `lib_deps` library regardless
+of whether the active `#if` branch ever reaches its `#include`, and the
+latest `WalterModem` from the registry needs newer ESP-IDF headers
+(`spi_flash_mmap.h`) than this project's pinned 3.1.3 core ships -
+confirmed by an actual failed build, not a guess. Since
+`TELEMETRY_TRANSPORT_WIFI` stays `1` (WiFi bring-up) through Phase 4 of
+the ongoing rework, the cellular code path isn't built yet either way.
+Phase 5 (dual-stack refactor) has to solve the real compatibility
+question - which `WalterModem` version pairs cleanly with core 3.1.3 -
+before re-adding it.
 
 Once a device is mounted, every further update goes through
 `http://<node-ip>/update` (see "What's running" below) - there is no
@@ -105,13 +118,20 @@ with `ESP_ERR_INVALID_STATE` from the very first transaction - see
 [espressif/arduino-esp32#11374](https://github.com/espressif/arduino-esp32/issues/11374).
 3.1.3 uses the older, working I2C driver.
 
-`platformio.ini` pins this explicitly via `platform_packages` (the
-framework is fetched from the official 3.1.3 GitHub release zip, not
-just a `platform = espressif32@X.Y.Z` version number, since that mapping
-isn't precise enough to trust blindly for a board with no physical
-fallback). **Verify after the first `pio run`** that the resolved core is
-actually 3.1.3 before relying on it - re-test this pin before ever
-upgrading it.
+`platformio.ini` pins this via a full platform URL, not
+`platform = espressif32@X.Y.Z` - **confirmed by an actual build** that the
+official PlatformIO registry's `framework-arduinoespressif32` package
+tops out at a Dec-2024 snapshot (nowhere near 3.1.3) and can't build this
+firmware at all (missing LEDC struct fields `WalterFeels.cpp` needs).
+The community-maintained
+[pioarduino/platform-espressif32](https://github.com/pioarduino/platform-espressif32)
+fork publishes a release tag per exact arduino-esp32 version - tag
+`53.03.13` is "Arduino core 3.1.3 based on IDF 5.3.2.250210", the same
+core the original Arduino IDE flash used. This has been verified with a
+real, successful build (RAM 16.2%, Flash 48.9%) - not just a version
+number match. Re-verify this URL still resolves before ever changing it;
+if pioarduino publishes a newer 3.1.x patch tag, prefer this repo's
+already-tested `53.03.13` over an untested newer one.
 
 The partition scheme (`ffat.csv`, vendored in this repo, copied verbatim
 from the Arduino IDE's "fatflash" / "16M Flash (2MB APP/12.5MB FATFS)"

@@ -14,6 +14,10 @@
 #ifndef TELEMETRY_H
 #define TELEMETRY_H
 
+#include <stddef.h> /* size_t - previously relied on transitive inclusion via
+                      * Arduino.h always being included first by whatever
+                      * pulled this header in; broke once portal.cpp started
+                      * including telemetry.h more directly. */
 #include <stdint.h>
 
 typedef struct {
