@@ -204,6 +204,7 @@ async function refresh(){
     badges.appendChild(badge(stateText,stateCls));
     if(t.chg.cold_block)badges.appendChild(badge('Blok. zima ('+t.chg.cold_block_cycles+'x)','off'));
     if(t.wifi_rssi!==undefined)badges.appendChild(badge('WiFi '+t.wifi_rssi+' dBm',t.wifi_rssi>-70?'on':'warn'));
+    if(t.mqtt!==undefined)badges.appendChild(badge(t.mqtt?'MQTT pripojene':'MQTT NEpripojene',t.mqtt?'on':'off'));
     if(!t.chg.flags.ok_to_charge)badges.appendChild(badge('NOT ok_to_charge','off'));
 
     $('flow-panel').textContent=(t.chg.vin*t.chg.iin).toFixed(1)+' W';

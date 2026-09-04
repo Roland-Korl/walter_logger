@@ -306,6 +306,10 @@ static void collectTelemetry(telemetry_sample_t* s)
     s->wifi_valid = true;
     s->wifi_rssi_dbm = (int8_t) WiFi.RSSI();
   }
+#if MQTT_WIFI_ENABLED
+  s->mqtt_bridge_enabled = true;
+  s->mqtt_connected = mqttClient.connected();
+#endif
 #endif
 
   portalPushSample(s);

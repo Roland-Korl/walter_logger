@@ -107,6 +107,13 @@ typedef struct {
   bool wifi_valid;
   int8_t wifi_rssi_dbm;
 
+  /* --- MQTT-over-WiFi bridge status (WiFi mode only) - lets the
+   * dashboard show "configured but can't reach the broker" instead of
+   * silently showing no data at all, which is otherwise
+   * indistinguishable from "bridge disabled" or "not configured yet". */
+  bool mqtt_bridge_enabled;
+  bool mqtt_connected;
+
   /* --- accumulated safety metric ---
    * Running count of wake cycles (roughly SLEEP_INTERVAL_S seconds each)
    * since last power-on where charging was found blocked by cold. Per

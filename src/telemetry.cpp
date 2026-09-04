@@ -110,5 +110,9 @@ size_t telemetryToJson(const telemetry_sample_t* s, char* out_buf, size_t out_bu
     doc["wifi_rssi"] = s->wifi_rssi_dbm;
   }
 
+  if(s->mqtt_bridge_enabled) {
+    doc["mqtt"] = s->mqtt_connected;
+  }
+
   return serializeJson(doc, out_buf, out_buf_size);
 }
