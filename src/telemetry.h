@@ -20,6 +20,14 @@
                       * including telemetry.h more directly. */
 #include <stdint.h>
 
+/* Compile-time build stamp, included in every telemetry JSON payload
+ * ("fw" field) and shown on the dashboard - makes it obvious at a
+ * glance which build is actually running on a given node, useful for
+ * exactly the kind of "is this the binary I think it is" question that
+ * comes up during OTA testing. __DATE__/__TIME__ are standard C, no
+ * extra tooling or git integration needed. */
+#define FIRMWARE_BUILT (__DATE__ " " __TIME__)
+
 typedef struct {
   /* --- identity --- */
   uint32_t node_id;

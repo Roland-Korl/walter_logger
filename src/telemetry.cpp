@@ -46,6 +46,7 @@ size_t telemetryToJson(const telemetry_sample_t* s, char* out_buf, size_t out_bu
 
   doc["node"] = s->node_id;
   doc["boot"] = s->boot_count;
+  doc["fw"] = FIRMWARE_BUILT;
   if(s->unix_time > 0) {
     doc["t"] = s->unix_time;
   }

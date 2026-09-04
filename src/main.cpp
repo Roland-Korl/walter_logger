@@ -41,6 +41,7 @@
 #include "ds18b20.h"
 #include "telemetry.h"
 #include "portal.h"
+#include "settings.h"
 #include "config.h"
 
 #if CO2_SENSOR_ENABLED
@@ -317,9 +318,9 @@ static void collectTelemetry(telemetry_sample_t* s)
 static bool wifiConnect()
 {
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.begin(settings.wifiSsid.c_str(), settings.wifiPass.c_str());
 
-  Serial.printf("Connecting to WiFi '%s'", WIFI_SSID);
+  Serial.printf("Connecting to WiFi '%s'", settings.wifiSsid.c_str());
   uint32_t start = millis();
   while(WiFi.status() != WL_CONNECTED) {
     if(millis() - start > (uint32_t) WIFI_CONNECT_TIMEOUT_S * 1000) {
@@ -475,6 +476,18 @@ void setup()
 
   bringUpPowerAndSensors();
 
+  /* Deliberately AFTER bringUpPowerAndSensors(), not before: nothing
+   * before this point reads settings.* (WiFi/OTA/MQTT credentials are
+   * only needed starting a few lines below), and ltc4015SafeInit() -
+   * called from bringUpPowerAndSensors() - has its own tight, already
+   * documented as occasionally-marginal timing window for the LTC4015's
+   * measurement subsystem to report ready. That function is
+   * charging-safety-critical and stays untouched; this is only a
+   * call-ORDER change in main.cpp, so NVS access (flash I/O, non-zero
+   * latency, worse on a namespace's very first use) can't insert itself
+   * before the safety check and skew it. */
+  settingsLoad();
+
 #if TELEMETRY_TRANSPORT_WIFI
   if(!wifiConnect()) {
     Serial.println("Error: WiFi connect failed - will keep retrying in loop()");
@@ -487,11 +500,11 @@ void setup()
 #if MQTT_WIFI_ENABLED
   snprintf(mqtt_wifi_topic, sizeof(mqtt_wifi_topic), "%s", MQTT_WIFI_TOPIC_FMT);
   snprintf(mqtt_wifi_client_id, sizeof(mqtt_wifi_client_id), MQTT_WIFI_CLIENT_ID_FMT, NODE_ID);
-  mqttClient.setServer(MQTT_WIFI_HOST, MQTT_WIFI_PORT);
+  mqttClient.setServer(settings.mqttHost.c_str(), settings.mqttPort);
   mqttClient.setBufferSize(sizeof(json_buf)); /* default 256B is far too small for our payload */
-  Serial.printf("MQTT-over-WiFi bridge target: %s:%d, topic '%s' (see config.h - not yet "
-                "confirmed reachable/correct, see the MQTT_WIFI_* comment there)\r\n",
-                MQTT_WIFI_HOST, MQTT_WIFI_PORT, mqtt_wifi_topic);
+  Serial.printf("MQTT-over-WiFi bridge target: %s:%d, topic '%s' (see /config - not yet "
+                "confirmed reachable/correct, see the MQTT_WIFI_* comment in config.h)\r\n",
+                settings.mqttHost.c_str(), settings.mqttPort, mqtt_wifi_topic);
 #endif
 #else
   snprintf(mqtt_topic, sizeof(mqtt_topic), MQTT_TOPIC_FMT, NODE_ID);
@@ -611,13 +624,14 @@ void loop()
       if(now - last_mqtt_attempt_ms >= 15000) {
         last_mqtt_attempt_ms = now;
         bool ok;
-        if(strlen(MQTT_WIFI_USERNAME) > 0) {
-          ok = mqttClient.connect(mqtt_wifi_client_id, MQTT_WIFI_USERNAME, MQTT_WIFI_PASSWORD);
+        if(settings.mqttUser.length() > 0) {
+          ok = mqttClient.connect(mqtt_wifi_client_id, settings.mqttUser.c_str(),
+                                  settings.mqttPass.c_str());
         } else {
           ok = mqttClient.connect(mqtt_wifi_client_id);
         }
-        Serial.printf("MQTT connect to %s:%d: %s\r\n", MQTT_WIFI_HOST, MQTT_WIFI_PORT,
-                      ok ? "OK" : "FAILED (broker unreachable or refused - see config.h note "
+        Serial.printf("MQTT connect to %s:%d: %s\r\n", settings.mqttHost.c_str(), settings.mqttPort,
+                      ok ? "OK" : "FAILED (broker unreachable or refused - see /config note "
                                    "about unconfirmed network routing/topic)");
       }
     }

@@ -6,6 +6,7 @@
 #include <WiFi.h>
 
 #include "config.h"
+#include "settings.h"
 
 static WebServer server(HTTP_SERVER_PORT);
 static bool otaBusy = false;
@@ -108,7 +109,7 @@ footer{text-align:center;color:var(--muted);font-size:12px;padding:18px 0 4px}
 .err{background:rgba(240,98,90,.1);border:1px solid rgba(240,98,90,.35);color:var(--red);border-radius:10px;padding:10px 14px;margin-bottom:14px;display:none}
 </style></head>
 <body><div class="wrap">
-<header><h1><span class="dot" id="live-dot"></span>Walter Feels &mdash; solar/LiFePO4 test</h1><span class="sub"><span id="boot-label"></span> &middot; <a href="/update" style="color:var(--muted)">OTA update</a></span></header>
+<header><h1><span class="dot" id="live-dot"></span>Walter Feels &mdash; solar/LiFePO4 test</h1><span class="sub"><span id="boot-label"></span> &middot; <a href="/config" style="color:var(--muted)">Nastavenie</a> &middot; <a href="/update" style="color:var(--muted)">OTA update</a></span></header>
 <div class="err" id="err-banner">Nepodarilo sa nacitat telemetriu - skusam znova...</div>
 
 <div class="row">
@@ -193,7 +194,7 @@ async function refresh(){
     const h=hRes.ok?await hRes.json():[];
     $('err-banner').style.display='none';
     $('live-dot').className='dot ok';
-    $('boot-label').textContent='Node '+t.node+' - boot #'+t.boot;
+    $('boot-label').textContent='Node '+t.node+' - boot #'+t.boot+(t.fw?' - fw '+t.fw:'');
 
     const [stateText,stateCls]=chargeStateText(t.chg.flags);
     $('charge-state-big').innerHTML=(t.chg.vin*t.chg.iin).toFixed(1)+'<small>W z panela</small>';
@@ -295,21 +296,29 @@ static void handleHistoryJson()
 }
 
 /* ---------------------------------------------------------------------
- * OTA update page - Update.h based, ported verbatim (in spirit) from
- * pv-logger-c3's src/portal.cpp handleUpdateUpload/handleUpdateDone.
- * Guarded by HTTP Basic Auth (OTA_USERNAME/OTA_PASSWORD).
+ * Shared CSS for /update and /config - both are simple form pages,
+ * separate from DASHBOARD_HTML's own inline style.
  * ------------------------------------------------------------------- */
-static const char STYLE_UPDATE[] PROGMEM = R"CSS(
+static const char STYLE_FORM[] PROGMEM = R"CSS(
 <style>
 :root{--bg:#0a0d12;--card:#12161d;--border:#232a35;--text:#e8ecf1;--muted:#8a93a3;--blue:#4fa8f5;--red:#f0625a}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text);font:14px -apple-system,Segoe UI,Roboto,sans-serif;padding:16px}
 .wrap{max-width:640px;margin:0 auto}
-h1{font-size:17px;margin:0 0 18px}
+h1{font-size:17px;margin:0 0 6px}
+h2{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin:20px 0 8px}
 a{color:var(--blue)}
+nav{display:flex;gap:8px;margin-bottom:18px;flex-wrap:wrap}
+nav a{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:6px 12px;font-size:13px;text-decoration:none;color:var(--text)}
 .note{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px 14px;margin-bottom:16px;color:var(--muted);line-height:1.6}
+label{display:block;color:var(--muted);font-size:12px;margin:12px 0 4px;text-transform:uppercase;letter-spacing:.04em}
+input[type=text],input[type=password],input[type=number],select{width:100%;background:#0d1117;color:var(--text);
+border:1px solid var(--border);border-radius:8px;padding:9px 11px;font:14px inherit}
 input[type=file]{width:100%;background:#0d1117;color:var(--text);border:1px solid var(--border);border-radius:8px;padding:10px}
+input:focus,select:focus{outline:0;border-color:var(--blue)}
 button{background:var(--blue);color:#06121f;border:0;border-radius:8px;padding:10px 18px;font:600 14px inherit;cursor:pointer;margin-top:12px}
+button.danger{background:var(--red);color:#fff}
+.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:18px}
 progress{width:100%;height:9px;margin-top:14px;display:none}
 .sub{color:var(--muted);margin-top:8px}
 </style>
@@ -319,6 +328,7 @@ static const char PAGE_UPDATE[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="sk"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Walter Feels &mdash; aktualizacia</title>%STYLE%</head><body><div class="wrap">
+<nav><a href="/">Prehlad</a><a href="/config">Nastavenie</a><a href="/update">Aktualizacia</a></nav>
 <h1>Aktualizacia firmveru</h1>
 <div class="note">Vyber <b>firmware.bin</b>. Zariadenie neodpajaj od napajania,
 kym prebieha nahravanie. Po dokonceni sa samo restartuje, nastavenie
@@ -349,11 +359,171 @@ document.getElementById('f').onsubmit=function(e){
 
 static bool requireAuth()
 {
-  if(!server.authenticate(OTA_USERNAME, OTA_PASSWORD)) {
+  if(!server.authenticate(settings.otaUser.c_str(), settings.otaPass.c_str())) {
     server.requestAuthentication();
     return false;
   }
   return true;
+}
+
+/* ---------------------------------------------------------------------
+ * /config, /factory - NVS-backed runtime settings, ported (in spirit)
+ * from pv-logger-c3's src/portal.cpp handleConfigGet/Post/handleFactory.
+ * No BSSID pinning field here (walter_logger doesn't need it - see the
+ * walter_logger integration plan's resolved open questions). `rat`
+ * (cellular radio access technology) isn't exposed here either: it's a
+ * raw numeric code whose meaning depends on the WalterModem library,
+ * which isn't linked into this build yet (Phase 5) - editing it blind
+ * wouldn't be useful before then.
+ * ------------------------------------------------------------------- */
+static String esc(const String &s)
+{
+  String o = s;
+  o.replace("&", "&amp;");
+  o.replace("\"", "&quot;");
+  o.replace("<", "&lt;");
+  o.replace(">", "&gt;");
+  return o;
+}
+
+static const char PAGE_CONFIG_HEAD[] PROGMEM = R"HTML(
+<!DOCTYPE html><html lang="sk"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Walter Feels &mdash; nastavenie</title>%STYLE%</head><body><div class="wrap">
+<nav><a href="/">Prehlad</a><a href="/config">Nastavenie</a><a href="/update">Aktualizacia</a></nav>
+<h1>Nastavenie zariadenia</h1>
+<div class="note">Identifikator zariadenia je kluc, pod ktorym bude lezat
+historia na serveri (Faza 4). Zmena hesla k WiFi zariadenie na chvilu
+odpoji od siete - uloz len vtedy, ked si si istý spravnymi udajmi.</div>
+<form method="POST" action="/config">
+)HTML";
+
+static void handleConfigGet()
+{
+  if(!requireAuth()) {
+    return;
+  }
+
+  String h = FPSTR(PAGE_CONFIG_HEAD);
+  h.replace("%STYLE%", FPSTR(STYLE_FORM));
+
+  h += F("<h2>Identita</h2><label>Device ID</label>"
+         "<input type=\"text\" name=\"dev\" required pattern=\"[A-Za-z0-9_-]{1,32}\" value=\"");
+  h += esc(settings.deviceId);
+  h += F("\">");
+
+  h += F("<h2>WiFi</h2><label>Siet (SSID)</label><input type=\"text\" name=\"wssid\" value=\"");
+  h += esc(settings.wifiSsid);
+  h += F("\"><label>Heslo (prazdne = nemenit)</label>"
+         "<input type=\"password\" name=\"wpass\" placeholder=\"********\">");
+
+  h += F("<h2>Siet</h2><label>Staticka adresa</label><select name=\"sfix\">");
+  h += settings.useStaticIp ? F("<option value=\"1\" selected>ano</option><option value=\"0\">nie (DHCP)</option>")
+                            : F("<option value=\"1\">ano</option><option value=\"0\" selected>nie (DHCP)</option>");
+  h += F("</select><label>IP adresa</label><input type=\"text\" name=\"sip\" value=\"");
+  h += esc(settings.ip);
+  h += F("\"><label>Brana</label><input type=\"text\" name=\"sgw\" value=\"");
+  h += esc(settings.gw);
+  h += F("\"><label>Maska</label><input type=\"text\" name=\"smask\" value=\"");
+  h += esc(settings.mask);
+  h += F("\"><label>DNS</label><input type=\"text\" name=\"sdns\" value=\"");
+  h += esc(settings.dns);
+  h += F("\">");
+
+  h += F("<h2>OTA (/update)</h2><label>Pouzivatel</label><input type=\"text\" name=\"otau\" value=\"");
+  h += esc(settings.otaUser);
+  h += F("\"><label>Heslo (prazdne = nemenit)</label>"
+         "<input type=\"password\" name=\"otap\" placeholder=\"********\">");
+
+  h += F("<h2>MQTT most (WiFi)</h2><label>Broker</label><input type=\"text\" name=\"mhost\" value=\"");
+  h += esc(settings.mqttHost);
+  h += F("\"><label>Port</label><input type=\"number\" name=\"mport\" min=\"1\" max=\"65535\" value=\"");
+  h += String(settings.mqttPort);
+  h += F("\"><label>Pouzivatel</label><input type=\"text\" name=\"muser\" value=\"");
+  h += esc(settings.mqttUser);
+  h += F("\"><label>Heslo (prazdne = nemenit)</label>"
+         "<input type=\"password\" name=\"mpass\" placeholder=\"********\">");
+
+  h += F("<h2>Celularne pripojenie (zatial nepouzite)</h2>"
+         "<label>APN</label><input type=\"text\" name=\"apn\" value=\"");
+  h += esc(settings.apn);
+  h += F("\">");
+
+  h += F("<h2>Uporny rezim (zatial nepouzity)</h2>"
+         "<label>Zapnuty</label><select name=\"usp\">");
+  h += settings.usporny ? F("<option value=\"1\" selected>ano</option><option value=\"0\">nie</option>")
+                        : F("<option value=\"1\">ano</option><option value=\"0\" selected>nie</option>");
+  h += F("</select><label>Perioda [s]</label><input type=\"number\" name=\"per\" min=\"20\" max=\"280\" value=\"");
+  h += String(settings.periodaS);
+  h += F("\"><label>Okno na OTA po prikaze [s]</label>"
+         "<input type=\"number\" name=\"otaw\" min=\"60\" max=\"3600\" value=\"");
+  h += String(settings.oknoOtaS);
+  h += F("\">");
+
+  h += F("<div class=\"actions\"><button type=\"submit\">Ulozit a restartovat</button>"
+         "<a href=\"/\">Spat</a></div></form>"
+         "<form method=\"POST\" action=\"/factory\" "
+         "onsubmit=\"return confirm('Naozaj zmazat nastavenie a vratit sa k tovarenskym hodnotam?')\">"
+         "<div class=\"actions\"><button class=\"danger\" type=\"submit\">Tovarenske nastavenia</button></div>"
+         "</form></div></body></html>");
+  server.send(200, "text/html; charset=utf-8", h);
+}
+
+static void handleConfigPost()
+{
+  if(!requireAuth()) {
+    return;
+  }
+
+  if(server.hasArg("dev")) settings.deviceId = server.arg("dev");
+  if(server.hasArg("wssid")) settings.wifiSsid = server.arg("wssid");
+  // Empty password field means "leave unchanged" - otherwise every save
+  // would wipe it, since the form never echoes real passwords back.
+  if(server.hasArg("wpass") && server.arg("wpass").length()) settings.wifiPass = server.arg("wpass");
+  if(server.hasArg("sfix")) settings.useStaticIp = (server.arg("sfix") == "1");
+  if(server.hasArg("sip")) settings.ip = server.arg("sip");
+  if(server.hasArg("sgw")) settings.gw = server.arg("sgw");
+  if(server.hasArg("smask")) settings.mask = server.arg("smask");
+  if(server.hasArg("sdns")) settings.dns = server.arg("sdns");
+  if(server.hasArg("otau")) settings.otaUser = server.arg("otau");
+  if(server.hasArg("otap") && server.arg("otap").length()) settings.otaPass = server.arg("otap");
+  if(server.hasArg("mhost")) settings.mqttHost = server.arg("mhost");
+  if(server.hasArg("mport")) settings.mqttPort = (uint16_t) server.arg("mport").toInt();
+  if(server.hasArg("muser")) settings.mqttUser = server.arg("muser");
+  if(server.hasArg("mpass") && server.arg("mpass").length()) settings.mqttPass = server.arg("mpass");
+  if(server.hasArg("apn")) settings.apn = server.arg("apn");
+  if(server.hasArg("usp")) settings.usporny = (server.arg("usp") == "1");
+  if(server.hasArg("per")) {
+    long v = server.arg("per").toInt();
+    settings.periodaS = (uint32_t) constrain(v, 20, 280);
+  }
+  if(server.hasArg("otaw")) {
+    settings.oknoOtaS = (uint32_t) constrain(server.arg("otaw").toInt(), 60, 3600);
+  }
+
+  settingsSave();
+  server.send(200, "text/html; charset=utf-8",
+              "<!DOCTYPE html><html lang=\"sk\"><head><meta charset=\"utf-8\">"
+              "<meta http-equiv=\"refresh\" content=\"6;url=/\"></head>"
+              "<body style=\"background:#0a0d12;color:#e8ecf1;font:15px system-ui;padding:28px\">"
+              "Ulozene. Zariadenie sa restartuje a o chvilu ta presmeruje spat.</body></html>");
+  delay(400);
+  ESP.restart();
+}
+
+static void handleFactory()
+{
+  if(!requireAuth()) {
+    return;
+  }
+
+  settingsFactoryReset();
+  server.send(200, "text/html; charset=utf-8",
+              "<!DOCTYPE html><html lang=\"sk\"><head><meta charset=\"utf-8\"></head>"
+              "<body style=\"background:#0a0d12;color:#e8ecf1;font:15px system-ui;padding:28px\">"
+              "Nastavenie zmazane, zariadenie sa restartuje s tovarenskymi hodnotami.</body></html>");
+  delay(400);
+  ESP.restart();
 }
 
 static void handleUpdateGet()
@@ -362,7 +532,7 @@ static void handleUpdateGet()
     return;
   }
   String html = FPSTR(PAGE_UPDATE);
-  html.replace("%STYLE%", FPSTR(STYLE_UPDATE));
+  html.replace("%STYLE%", FPSTR(STYLE_FORM));
   server.send(200, "text/html; charset=utf-8", html);
 }
 
@@ -380,7 +550,7 @@ static void handleUpdateDone()
 
 static void handleUpdateUpload()
 {
-  if(!server.authenticate(OTA_USERNAME, OTA_PASSWORD)) {
+  if(!server.authenticate(settings.otaUser.c_str(), settings.otaPass.c_str())) {
     /* Upload callback can't send a normal auth challenge mid-stream -
      * just refuse to write anything and let handleUpdateDone() report
      * the failure via Update.hasError(). */
@@ -416,14 +586,20 @@ void portalBegin()
   server.on("/", handleRoot);
   server.on("/telemetry", handleTelemetryJson);
   server.on("/history", handleHistoryJson);
+  server.on("/config", HTTP_GET, handleConfigGet);
+  server.on("/config", HTTP_POST, handleConfigPost);
+  server.on("/factory", HTTP_POST, handleFactory);
   server.on("/update", HTTP_GET, handleUpdateGet);
   server.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
   server.begin();
 
   Serial.printf("HTTP server listening on port %d (OTA at /update)\r\n", HTTP_SERVER_PORT);
-  if(strcmp(OTA_PASSWORD, "CHANGE-ME-before-wall-mount") == 0) {
-    Serial.println("*** WARNING: OTA_PASSWORD is still the default placeholder - anyone on "
-                    "the WiFi network can push firmware to this board. Change it in config.h "
+  // Checked against the RUNTIME value (settings.otaPass), not the
+  // compile-time OTA_PASSWORD macro - after a /config save these can
+  // differ, and it's the runtime value that actually guards /update.
+  if(settings.otaPass == "CHANGE-ME-before-wall-mount") {
+    Serial.println("*** WARNING: OTA password is still the default placeholder - anyone on "
+                    "the WiFi network can push firmware to this board. Change it via /config "
                     "before mounting it somewhere you can't easily re-flash over USB. ***");
   }
 }
