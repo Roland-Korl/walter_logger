@@ -65,7 +65,11 @@ size_t telemetryToJson(const telemetry_sample_t* s, char* out_buf, size_t out_bu
     chg["bsr_raw"] = s->bsr_raw;
   }
   chg["die_c"] = s->die_temp_c;
-  chg["ntc_c"] = s->ntc_valid ? s->ntc_temp_c : (float) NAN;
+  if(s->ntc_valid) {
+    chg["ntc_c"] = s->ntc_temp_c;
+  } else {
+    chg["ntc_c"] = nullptr;
+  }
   chg["jeita_region"] = s->jeita_region_estimated;
   chg["state"] = s->charger_state;
   chg["status"] = s->charge_status;
@@ -75,7 +79,11 @@ size_t telemetryToJson(const telemetry_sample_t* s, char* out_buf, size_t out_bu
   addDecodedFlags(chg, s);
 
   JsonObject temp = doc["temp"].to<JsonObject>();
-  temp["ds18b20_c"] = s->ds18b20_valid ? s->ds18b20_temp_c : (float) NAN;
+  if(s->ds18b20_valid) {
+    temp["ds18b20_c"] = s->ds18b20_temp_c;
+  } else {
+    temp["ds18b20_c"] = nullptr;
+  }
   temp["disagree"] = s->temp_sensors_disagree;
 
   if(s->env_valid) {
@@ -102,11 +110,5 @@ size_t telemetryToJson(const telemetry_sample_t* s, char* out_buf, size_t out_bu
     doc["wifi_rssi"] = s->wifi_rssi_dbm;
   }
 
-  /* ArduinoJson serializes NaN as the bare token `NaN`, which is not
-   * valid JSON but is what we want here: an invalid-reading field is
-   * visually obvious in the raw payload and most JSON parsers used for
-   * log ingestion (e.g. Python's json module) accept it by default. If
-   * your MQTT consumer uses a strict JSON parser, replace the two NAN
-   * assignments above with `nullptr` instead. */
   return serializeJson(doc, out_buf, out_buf_size);
 }

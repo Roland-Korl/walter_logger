@@ -93,6 +93,7 @@ static bool co2_sensor_installed = false;
 static WiFiClient mqttTcpClient;
 static PubSubClient mqttClient(mqttTcpClient);
 static char mqtt_wifi_topic[64];
+static char mqtt_wifi_status_topic[64];
 static char mqtt_wifi_client_id[48];
 #endif
 #else
@@ -516,8 +517,18 @@ void setup()
   portalBegin();
 
 #if MQTT_WIFI_ENABLED
-  snprintf(mqtt_wifi_topic, sizeof(mqtt_wifi_topic), "%s", MQTT_WIFI_TOPIC_FMT);
-  snprintf(mqtt_wifi_client_id, sizeof(mqtt_wifi_client_id), MQTT_WIFI_CLIENT_ID_FMT, NODE_ID);
+  /* Built from settings.deviceId, not the old MQTT_WIFI_TOPIC_FMT/
+   * MQTT_WIFI_CLIENT_ID_FMT format strings - those were never actually
+   * formatted with a %d (a real bug: every node would have published to
+   * the literal same topic, "pv/pv03/telemetry", regardless of NODE_ID).
+   * New prefix ("charger/", not "pv/" or "solar/") keeps this device
+   * family's MQTT namespace distinct from pv-logger's Victron nodes -
+   * see the walter_logger integration plan. */
+  snprintf(mqtt_wifi_topic, sizeof(mqtt_wifi_topic), "charger/%s/telemetry",
+          settings.deviceId.c_str());
+  snprintf(mqtt_wifi_status_topic, sizeof(mqtt_wifi_status_topic), "charger/%s/status",
+          settings.deviceId.c_str());
+  snprintf(mqtt_wifi_client_id, sizeof(mqtt_wifi_client_id), "walter-%s", settings.deviceId.c_str());
   mqttClient.setServer(settings.mqttHost.c_str(), settings.mqttPort);
   mqttClient.setBufferSize(sizeof(json_buf)); /* default 256B is far too small for our payload */
   Serial.printf("MQTT-over-WiFi bridge target: %s:%d, topic '%s' (see /config - not yet "
@@ -641,12 +652,21 @@ void loop()
        * broker must not stall the local HTTP dashboard/OTA. */
       if(now - last_mqtt_attempt_ms >= 15000) {
         last_mqtt_attempt_ms = now;
+        /* Last Will + retained "online" on connect - mirrors
+         * pv-logger-c3's telemetry.cpp ensureConnected(): lets a
+         * backend/dashboard tell "device offline" apart from "device
+         * online but hasn't sent a fresh sample in a while" without
+         * guessing from sample age alone. */
         bool ok;
         if(settings.mqttUser.length() > 0) {
           ok = mqttClient.connect(mqtt_wifi_client_id, settings.mqttUser.c_str(),
-                                  settings.mqttPass.c_str());
+                                  settings.mqttPass.c_str(), mqtt_wifi_status_topic, 1, true,
+                                  "offline");
         } else {
-          ok = mqttClient.connect(mqtt_wifi_client_id);
+          ok = mqttClient.connect(mqtt_wifi_client_id, mqtt_wifi_status_topic, 1, true, "offline");
+        }
+        if(ok) {
+          mqttClient.publish(mqtt_wifi_status_topic, "online", true);
         }
         Serial.printf("MQTT connect to %s:%d: %s\r\n", settings.mqttHost.c_str(), settings.mqttPort,
                       ok ? "OK" : "FAILED (broker unreachable or refused - see /config note "
