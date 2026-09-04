@@ -150,6 +150,15 @@ further partition table change is needed for OTA to work.
 - **`/telemetry`** - the latest sample as JSON (see below).
 - **`/history`** - up to `HISTORY_LEN` (120) recent samples, oldest
   first, for the dashboard's sparklines. RAM-only, not persisted.
+- **`/config`** - NVS-backed runtime settings (HTTP Basic Auth), same
+  pattern as `pv-logger-c3`'s `/config`: device ID, WiFi, OTA
+  credentials, MQTT-over-WiFi bridge settings, and a **static IP**
+  block (IP/gateway/mask/DNS) that's dormant by default - the device
+  stays on DHCP until network placement is finalized (see the reserved
+  `10.10.10.70`-`.79` block for these "charger" nodes, documented in the
+  `pv-logger-c3` sibling project's README) - `/factory` (POST-only, a
+  button on this page) wipes all of it back to the `config.h` seed
+  defaults.
 - **`/update`** - firmware upload page (`<Update.h>`-based, HTTP Basic
   Auth via `OTA_USERNAME`/`OTA_PASSWORD`). `GET /update` serves the upload
   form, `POST /update` (multipart, the exported `.bin`) streams straight

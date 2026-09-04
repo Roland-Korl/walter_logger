@@ -318,6 +318,24 @@ static void collectTelemetry(telemetry_sample_t* s)
 static bool wifiConnect()
 {
   WiFi.mode(WIFI_STA);
+
+  // Static address must be set before begin(). Same rationale as
+  // pv-logger-c3: dormant by default (settings.useStaticIp seeds to
+  // false) - this device stays on DHCP until network placement is
+  // finalized. Silently falls back to DHCP if the fields don't parse,
+  // exactly like pv-logger-c3's src/main.cpp wifiConnect().
+  if(settings.useStaticIp) {
+    IPAddress ip, gw, mask, dns;
+    if(ip.fromString(settings.ip) && gw.fromString(settings.gw) &&
+       mask.fromString(settings.mask) && dns.fromString(settings.dns)) {
+      if(!WiFi.config(ip, gw, mask, dns)) {
+        Serial.println("!! failed to set static IP");
+      }
+    } else {
+      Serial.println("!! static IP fields don't parse - falling back to DHCP");
+    }
+  }
+
   WiFi.begin(settings.wifiSsid.c_str(), settings.wifiPass.c_str());
 
   Serial.printf("Connecting to WiFi '%s'", settings.wifiSsid.c_str());
