@@ -472,21 +472,6 @@ void setup()
   Serial.begin(115200);
   delay(200);
 
-#if TELEMETRY_TRANSPORT_WIFI
-  /* If the bootloader's app-rollback safety net is active, an OTA'd
-   * image stays "unconfirmed" (and gets auto-reverted to the previous
-   * one on the next reset) until something in the new firmware calls
-   * this. Getting this far in setup() is a reasonable "looks alive"
-   * signal. Harmless no-op if rollback isn't enabled in this build.
-   *
-   * NOTE: this only proves "reached line X of setup()", not "WiFi/portal
-   * actually came up" - Phase 6 of the walter_logger rework plan moves
-   * this call to after a confirmed-successful connectivity check, to
-   * close that gap. Left exactly as in the original firmware for this
-   * phase (Phase 1 is toolchain/OTA-mechanism only). */
-  esp_ota_mark_app_valid_cancel_rollback();
-#endif
-
   rtc_boot_count++;
 
   Serial.printf("\r\n=== Walter Feels solar/LiFePO4 test node %d (boot #%u) ===\r\n", NODE_ID,
@@ -514,6 +499,20 @@ void setup()
 #if TELEMETRY_TRANSPORT_WIFI
   if(!wifiConnect()) {
     Serial.println("Error: WiFi connect failed - will keep retrying in loop()");
+  } else {
+    /* Phase 6: moved here from the very top of setup() (immediately
+     * after Serial.begin(), before WiFi/portal were even attempted).
+     * If the bootloader's app-rollback safety net is active, an OTA'd
+     * image stays "unconfirmed" (auto-reverted to the previous one on
+     * the next reset) until this is called - calling it unconditionally
+     * at the top only proved "reached line 1 of setup()", not "WiFi/
+     * portal actually work". Calling it here instead means a firmware
+     * that boots but can't reach WiFi at all stays eligible for
+     * rollback-on-next-crash (if that mechanism is even active on this
+     * board/core - unverified, no spare unit to test it on - see the
+     * walter_logger integration plan). Harmless no-op either way if
+     * rollback isn't enabled in this build. */
+    esp_ota_mark_app_valid_cancel_rollback();
   }
 
   collectTelemetry(&latest_sample);
